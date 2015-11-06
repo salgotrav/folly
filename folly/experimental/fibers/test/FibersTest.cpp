@@ -1465,6 +1465,68 @@ TEST(FiberManager, resizePeriodically) {
   EXPECT_EQ(5, manager.fibersPoolSize());
 }
 
+TEST(FiberManager, batonWaitTimeoutHandler) {
+  FiberManager manager(folly::make_unique<EventBaseLoopController>());
+
+  folly::EventBase evb;
+  dynamic_cast<EventBaseLoopController&>(manager.loopController())
+    .attachEventBase(evb);
+
+  size_t fibersRun = 0;
+  Baton baton;
+  Baton::TimeoutHandler timeoutHandler;
+
+  manager.addTask([&]() {
+    baton.wait(timeoutHandler);
+    ++fibersRun;
+  });
+  manager.loopUntilNoReady();
+
+  EXPECT_FALSE(baton.try_wait());
+  EXPECT_EQ(0, fibersRun);
+
+  timeoutHandler.scheduleTimeout(std::chrono::milliseconds(250));
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  EXPECT_FALSE(baton.try_wait());
+  EXPECT_EQ(0, fibersRun);
+
+  evb.loopOnce();
+  manager.loopUntilNoReady();
+
+  EXPECT_EQ(1, fibersRun);
+}
+
+TEST(FiberManager, batonWaitTimeoutMany) {
+  FiberManager manager(folly::make_unique<EventBaseLoopController>());
+
+  folly::EventBase evb;
+  dynamic_cast<EventBaseLoopController&>(manager.loopController())
+    .attachEventBase(evb);
+
+  constexpr size_t kNumTimeoutTasks = 10000;
+  size_t tasksCount = kNumTimeoutTasks;
+
+  // We add many tasks to hit timeout queue deallocation logic.
+  for (size_t i = 0; i < kNumTimeoutTasks; ++i) {
+    manager.addTask([&]() {
+      Baton baton;
+      Baton::TimeoutHandler timeoutHandler;
+
+      folly::fibers::addTask([&] {
+        timeoutHandler.scheduleTimeout(std::chrono::milliseconds(1000));
+      });
+
+      baton.wait(timeoutHandler);
+      if (--tasksCount == 0) {
+        evb.terminateLoopSoon();
+      }
+    });
+  }
+
+  evb.loopForever();
+}
+
 static size_t sNumAwaits;
 
 void runBenchmark(size_t numAwaits, size_t toSend) {
